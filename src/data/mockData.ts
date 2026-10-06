@@ -3,6 +3,8 @@ import type {
   PlatformDailyMetric,
   PlatformMeta,
   PlatformName,
+  TopPost,
+  TrendPoint,
 } from "../types";
 import { DAY_MS, startOfUtcDay, utcDateKey } from "../lib/utils";
 
@@ -76,6 +78,48 @@ function metricsForDay(dateKey: string): PlatformDailyMetric[] {
   });
 }
 
+const POST_TITLES = [
+  "Behind the scenes: how we shoot a 15s ad",
+  "3 hooks that doubled our watch time",
+  "UGC vs studio: the honest numbers",
+  "Customer story: from 0 to 100k views",
+  "Trend jacking, done right",
+  "Our product, in 20 seconds",
+];
+
+function topPostsForDay(dateKey: string, metrics: PlatformDailyMetric[]): TopPost[] {
+  const rand = mulberry32(hashString(`${dateKey}:posts`));
+  return [...metrics]
+    .sort((a, b) => b.views - a.views)
+    .slice(0, 5)
+    .map((m, i) => {
+      const views = Math.round(m.views * (0.08 + rand() * 0.06));
+      return {
+        id: `${m.id}-${i}`,
+        platform: m.name,
+        title: POST_TITLES[Math.floor(rand() * POST_TITLES.length)],
+        views,
+        likes: Math.round(views * m.likesPerView * (1.1 + rand() * 0.6)),
+      };
+    })
+    .sort((a, b) => b.views - a.views);
+}
+
+function historyUpTo(day: Date, days = 14): TrendPoint[] {
+  const points: TrendPoint[] = [];
+  for (let i = days - 1; i >= 0; i--) {
+    const key = utcDateKey(new Date(startOfUtcDay(day).getTime() - i * DAY_MS));
+    const ms = metricsForDay(key);
+    points.push({
+      date: key,
+      views: ms.reduce((s, m) => s + m.views, 0),
+      likes: Math.round(ms.reduce((s, m) => s + m.views * m.likesPerView, 0)),
+      shares: Math.round(ms.reduce((s, m) => s + m.views * m.shareRate, 0)),
+    });
+  }
+  return points;
+}
+
 /** Builds the full payload for a UTC calendar day (synchronous, deterministic). */
 export function buildDailyPayload(day: Date): DailyPayload {
   const dateKey = utcDateKey(day);
@@ -83,19 +127,17 @@ export function buildDailyPayload(day: Date): DailyPayload {
   const previousViews: Record<string, number> = {};
   for (const m of metricsForDay(previousKey)) previousViews[m.id] = m.views;
 
+  const metrics = metricsForDay(dateKey);
   return {
     date: dateKey,
     syncedAt: `${dateKey}T00:00:00.000Z`,
-    metrics: metricsForDay(dateKey),
+    metrics,
     previousViews,
+    history: historyUpTo(day),
+    topPosts: topPostsForDay(dateKey, metrics),
+    source: "mock",
+    unconnected: [],
   };
-}
-
-/** Simulates the once-per-day API fetch (network latency included). */
-export function fetchDailyPayload(day: Date, latencyMs = 900): Promise<DailyPayload> {
-  return new Promise((resolve) => {
-    window.setTimeout(() => resolve(buildDailyPayload(day)), latencyMs);
-  });
 }
 
 export const PLATFORM_ORDER: PlatformName[] = BASE_METRICS.map((m) => m.name);

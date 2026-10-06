@@ -34,3 +34,14 @@ export function formatCountdown(ms: number): string {
   const m = totalMinutes % 60;
   return `${h}h ${m.toString().padStart(2, "0")}m`;
 }
+
+export function formatClockTime(iso: string, tz: string): string {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
+  }).format(new Date(iso));
+}
