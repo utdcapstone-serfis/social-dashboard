@@ -1,559 +1,463 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import {
+  Area,
   Cell,
+  ComposedChart,
+  Line,
   Pie,
   PieChart,
   ResponsiveContainer,
   Tooltip,
+  XAxis,
+  YAxis,
 } from "recharts";
-import {
-  ArrowDownRight,
-  ArrowUpRight,
-  CalendarClock,
-  CheckCircle2,
-  Eye,
-  FastForward,
-  Heart,
-  Repeat2,
-  RefreshCw,
-  Share2,
-  Timer,
-} from "lucide-react";
-import type { DailyPayload, PlatformDailyMetric } from "../types";
-import {
-  PLATFORM_META,
-  buildDailyPayload,
-  fetchDailyPayload,
-} from "../data/mockData";
-import {
-  DAY_MS,
-  cn,
-  formatCompact,
-  formatCountdown,
-  formatFull,
-  formatPercent,
-  startOfUtcDay,
-  utcDateKey,
-} from "../lib/utils";
+import { ArrowDownRight, ArrowUpRight, CalendarClock, CheckCircle2, RefreshCw, Timer, Unplug } from "lucide-react";
+import type { DailyPayload, PlatformDailyMetric, TopPost } from "../types";
+import { PLATFORM_META } from "../data/mockData";
+import { useDailyPayload } from "../hooks/useDailyPayload";
+import { DASHBOARD_TZ } from "../lib/schedule";
+import { cn, formatClockTime, formatCompact, formatCountdown, formatFull, formatPercent } from "../lib/utils";
 
-const CACHE_KEY = "social-dashboard:payload:v1";
-const OFFSET_KEY = "social-dashboard:day-offset:v1";
+/**
+ * Some brand colors (Threads black, LinkedIn navy) vanish on the dark theme,
+ * so charts use these lifted variants. PLATFORM_META itself is untouched.
+ */
+const DARK_COLOR: Partial<Record<string, string>> = {
+  Threads: "#E4E4E7",
+  LinkedIn: "#3B82C4",
+  Facebook: "#4C8DF6",
+  YouTube: "#FF4E45",
+};
+const colorOf = (name: PlatformDailyMetric["name"]): string => DARK_COLOR[name] ?? PLATFORM_META[name].color;
 
-/* ----------------------------- persistence ----------------------------- */
+const NA = "n/a";
+const pct = (ratio: number): string => (ratio > 0 ? formatPercent(ratio) : NA);
 
-function readCache(): DailyPayload | null {
-  try {
-    const raw = window.localStorage.getItem(CACHE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as DailyPayload;
-    return Array.isArray(parsed.metrics) && parsed.metrics.length === 11 ? parsed : null;
-  } catch {
-    return null;
-  }
+/* ------------------------------ small parts ------------------------------ */
+
+function Delta({ value, className }: { value: number; className?: string }) {
+  const up = value >= 0;
+  return (
+    <span className={cn("inline-flex items-center font-medium tabular-nums", up ? "text-up" : "text-down", className)}>
+      {up ? <ArrowUpRight className="h-3 w-3" aria-hidden /> : <ArrowDownRight className="h-3 w-3" aria-hidden />}
+      {formatPercent(Math.abs(value))}
+      <span className="sr-only"> {up ? "up" : "down"} versus yesterday</span>
+    </span>
+  );
 }
 
-function writeCache(payload: DailyPayload): void {
-  try {
-    window.localStorage.setItem(CACHE_KEY, JSON.stringify(payload));
-  } catch {
-    /* storage unavailable: the in-memory state still works */
-  }
+function Kpi({ label, value, hint, delta }: { label: string; value: string; hint: string; delta?: number }) {
+  return (
+    <div className="panel justify-between px-4 py-2.5">
+      <div className="panel-title">{label}</div>
+      <div className="flex items-baseline gap-2">
+        <span className="text-2xl font-bold leading-tight tabular-nums text-ink">{value}</span>
+        {delta !== undefined && <Delta value={delta} className="text-xs" />}
+      </div>
+      <div className="text-[11px] text-ink-faint">{hint}</div>
+    </div>
+  );
 }
 
-function readOffset(): number {
-  try {
-    const n = Number(window.localStorage.getItem(OFFSET_KEY));
-    return Number.isInteger(n) && n >= 0 ? n : 0;
-  } catch {
-    return 0;
-  }
+function PlatformBadge({ name, size = "h-5 w-5" }: { name: PlatformDailyMetric["name"]; size?: string }) {
+  const meta = PLATFORM_META[name];
+  return (
+    <span
+      className={cn("flex shrink-0 items-center justify-center rounded text-[9px] font-bold", size)}
+      style={{ backgroundColor: colorOf(name), color: DARK_COLOR[name] ? "#06030F" : meta.onColor }}
+      aria-hidden
+    >
+      {meta.badge}
+    </span>
+  );
 }
-
-function writeOffset(n: number): void {
-  try {
-    window.localStorage.setItem(OFFSET_KEY, String(n));
-  } catch {
-    /* ignore */
-  }
-}
-
-/* -------------------------------- hooks -------------------------------- */
-
-/** Wall-clock "now" re-evaluated every 30s plus a simulated day offset. */
-function useSimulatedNow(dayOffset: number): Date {
-  const [tick, setTick] = useState<number>(() => Date.now());
-  useEffect(() => {
-    const id = window.setInterval(() => setTick(Date.now()), 30_000);
-    return () => window.clearInterval(id);
-  }, []);
-  return useMemo(() => new Date(tick + dayOffset * DAY_MS), [tick, dayOffset]);
-}
-
-/* ------------------------------ sub-components ------------------------------ */
 
 interface ChartDatum {
   id: string;
-  name: string;
   label: string;
   views: number;
   color: string;
 }
 
-interface ChartTooltipProps {
-  active?: boolean;
-  payload?: Array<{ payload: ChartDatum }>;
-  total: number;
-}
+const tooltipStyle = {
+  background: "#0F032D",
+  border: "1px solid rgba(255,255,255,0.14)",
+  borderRadius: 8,
+  fontSize: 12,
+  color: "#EFEFEF",
+  padding: "6px 10px",
+} as const;
 
-function ChartTooltip({ active, payload, total }: ChartTooltipProps) {
-  if (!active || !payload || payload.length === 0) return null;
-  const d = payload[0].payload;
-  return (
-    <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm shadow-lg">
-      <div className="flex items-center gap-2 font-semibold text-slate-900">
-        <span className="h-3 w-3 rounded-sm border border-slate-300" style={{ backgroundColor: d.color }} />
-        {d.label}
-      </div>
-      <div className="mt-1 text-slate-600">
-        {formatFull(d.views)} views · {formatPercent(d.views / total)}
-      </div>
-    </div>
-  );
-}
+/* -------------------------------- panels -------------------------------- */
 
-interface MetricRowProps {
-  icon: React.ReactNode;
-  label: string;
-  value: string;
-  ratio: number; // 0..1, bar fill relative to the best platform
-  color: string;
-}
-
-function MetricRow({ icon, label, value, ratio, color }: MetricRowProps) {
-  return (
-    <div>
-      <div className="flex items-center justify-between text-sm">
-        <span className="flex items-center gap-1.5 text-slate-600">
-          {icon}
-          {label}
-        </span>
-        <span className="font-semibold tabular-nums text-slate-900">{value}</span>
-      </div>
-      <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-slate-100" aria-hidden="true">
-        <div
-          className="h-full rounded-full"
-          style={{ width: `${Math.max(2, Math.round(ratio * 100))}%`, backgroundColor: color }}
-        />
-      </div>
-    </div>
-  );
-}
-
-interface PlatformCardProps {
-  metric: PlatformDailyMetric;
-  previousViews: number;
-  maxima: { retention: number; likes: number; share: number };
-  hidden: boolean;
-  onToggle: () => void;
-}
-
-function PlatformCard({ metric, previousViews, maxima, hidden, onToggle }: PlatformCardProps) {
-  const meta = PLATFORM_META[metric.name];
-  const delta = previousViews > 0 ? (metric.views - previousViews) / previousViews : 0;
-  const up = delta >= 0;
+function BreakdownPanel({
+  data,
+  hidden,
+  onToggle,
+  onReset,
+}: {
+  data: ChartDatum[];
+  hidden: ReadonlySet<string>;
+  onToggle: (id: string) => void;
+  onReset: () => void;
+}) {
+  const total = data.reduce((s, d) => s + d.views, 0);
+  const visible = data.filter((d) => !hidden.has(d.id));
+  const visibleTotal = visible.reduce((s, d) => s + d.views, 0);
 
   return (
-    <article
-      className={cn(
-        "relative flex flex-col gap-4 overflow-hidden rounded-xl border border-slate-200 bg-white p-4 shadow-sm transition-opacity",
-        hidden && "opacity-60",
-      )}
-      aria-label={`${meta.label} daily metrics`}
-    >
-      <span className="absolute inset-x-0 top-0 h-1.5" style={{ backgroundColor: meta.color }} aria-hidden="true" />
-
-      <header className="flex items-center justify-between gap-3 pt-1">
-        <div className="flex min-w-0 items-center gap-3">
-          <span
-            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-sm font-bold"
-            style={{ backgroundColor: meta.color, color: meta.onColor }}
-            aria-hidden="true"
-          >
-            {meta.badge}
-          </span>
-          <h3 className="truncate text-base font-semibold text-slate-900">{meta.label}</h3>
-        </div>
+    <section className="panel p-3" aria-labelledby="breakdown-h">
+      <div className="flex items-center justify-between">
+        <h2 id="breakdown-h" className="panel-title">
+          Views by platform
+        </h2>
         <button
           type="button"
-          onClick={onToggle}
-          aria-pressed={!hidden}
-          className="shrink-0 rounded-md border border-slate-300 px-2 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-600"
+          onClick={onReset}
+          disabled={hidden.size === 0}
+          className="text-[11px] font-medium text-violet-soft hover:underline disabled:opacity-0"
         >
-          {hidden ? "Show in chart" : "In chart"}
+          Show all
         </button>
-      </header>
-
-      <div>
-        <div className="flex items-center gap-1.5 text-sm text-slate-600">
-          <Eye className="h-4 w-4" aria-hidden="true" />
-          Total views
-        </div>
-        <div className="mt-0.5 flex items-baseline gap-2">
-          <span className="text-3xl font-bold tabular-nums text-slate-900">{formatCompact(metric.views)}</span>
-          <span
-            className={cn(
-              "inline-flex items-center text-sm font-medium tabular-nums",
-              up ? "text-emerald-700" : "text-red-700",
-            )}
-          >
-            {up ? (
-              <ArrowUpRight className="h-4 w-4" aria-hidden="true" />
-            ) : (
-              <ArrowDownRight className="h-4 w-4" aria-hidden="true" />
-            )}
-            {formatPercent(Math.abs(delta))}
-            <span className="sr-only"> {up ? "up" : "down"} versus yesterday</span>
-          </span>
-        </div>
-        <div className="text-xs text-slate-500">{formatFull(metric.views)} views · vs yesterday</div>
       </div>
 
-      <div className="space-y-3">
-        <MetricRow
-          icon={<Repeat2 className="h-4 w-4" aria-hidden="true" />}
-          label="Retention rate"
-          value={formatPercent(metric.retentionRate)}
-          ratio={metric.retentionRate / maxima.retention}
-          color={meta.color}
-        />
-        <MetricRow
-          icon={<Heart className="h-4 w-4" aria-hidden="true" />}
-          label="Likes per view"
-          value={formatPercent(metric.likesPerView)}
-          ratio={metric.likesPerView / maxima.likes}
-          color={meta.color}
-        />
-        <MetricRow
-          icon={<Share2 className="h-4 w-4" aria-hidden="true" />}
-          label="Share rate"
-          value={formatPercent(metric.shareRate)}
-          ratio={metric.shareRate / maxima.share}
-          color={meta.color}
-        />
+      <div className="relative min-h-0 flex-1">
+        {visible.length > 0 ? (
+          <ResponsiveContainer width="100%" height="100%">
+            <PieChart>
+              <Pie
+                data={visible}
+                dataKey="views"
+                nameKey="label"
+                innerRadius="64%"
+                outerRadius="94%"
+                paddingAngle={2}
+                stroke="#0F032D"
+                strokeWidth={2}
+                isAnimationActive={false}
+              >
+                {visible.map((d) => (
+                  <Cell key={d.id} fill={d.color} />
+                ))}
+              </Pie>
+              <Tooltip
+                contentStyle={tooltipStyle}
+                itemStyle={{ color: "#EFEFEF" }}
+                formatter={(v: number, _n, item) => [
+                  `${formatFull(v)} · ${formatPercent(v / visibleTotal)}`,
+                  (item.payload as ChartDatum).label,
+                ]}
+              />
+            </PieChart>
+          </ResponsiveContainer>
+        ) : (
+          <div className="flex h-full items-center justify-center text-center text-xs text-ink-muted">
+            All platforms hidden.
+          </div>
+        )}
+        {visible.length > 0 && (
+          <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
+            <span className="text-[10px] uppercase tracking-wider text-ink-faint">
+              {visible.length}/{data.length} platforms
+            </span>
+            <span className="text-2xl font-bold tabular-nums">{formatCompact(visibleTotal)}</span>
+          </div>
+        )}
       </div>
-    </article>
+
+      <ul className="mt-2 grid grid-cols-2 gap-x-3 gap-y-0.5" aria-label="Chart legend, toggle platforms">
+        {data.map((d) => {
+          const off = hidden.has(d.id);
+          return (
+            <li key={d.id}>
+              <button
+                type="button"
+                onClick={() => onToggle(d.id)}
+                aria-pressed={!off}
+                className="flex w-full items-center gap-1.5 rounded px-1 py-0.5 text-left text-[11px] hover:bg-white/5"
+              >
+                <span
+                  className={cn("h-2 w-2 shrink-0 rounded-sm", off && "opacity-30")}
+                  style={{ backgroundColor: d.color }}
+                  aria-hidden
+                />
+                <span className={cn("flex-1 truncate", off ? "text-ink-faint line-through" : "text-ink")}>{d.label}</span>
+                <span className="tabular-nums text-ink-faint">{formatPercent(d.views / total, 0)}</span>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
   );
 }
 
-interface StatTileProps {
-  label: string;
-  value: string;
-  hint: string;
+function TrendPanel({ payload }: { payload: DailyPayload }) {
+  const data = useMemo(
+    () =>
+      (payload.history ?? []).map((p) => ({
+        label: p.date.slice(5),
+        views: p.views,
+        engagement: p.views > 0 ? (p.likes + p.shares) / p.views : 0,
+      })),
+    [payload.history],
+  );
+
+  return (
+    <section className="panel p-3" aria-labelledby="trend-h">
+      <div className="flex items-center justify-between">
+        <h2 id="trend-h" className="panel-title">
+          Engagement trend · {data.length || 0}d
+        </h2>
+        <div className="flex gap-3 text-[10px] text-ink-faint">
+          <span className="flex items-center gap-1">
+            <span className="h-1.5 w-3 rounded-sm bg-violet-bright" aria-hidden /> Views
+          </span>
+          <span className="flex items-center gap-1">
+            <span className="h-0.5 w-3 bg-accent-fuchsia" aria-hidden /> Engagement rate
+          </span>
+        </div>
+      </div>
+      <div className="min-h-0 flex-1 pt-1">
+        {data.length > 1 ? (
+          <ResponsiveContainer width="100%" height="100%">
+            <ComposedChart data={data} margin={{ top: 6, right: 0, bottom: 0, left: -18 }}>
+              <defs>
+                <linearGradient id="viewsFill" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#905BF4" stopOpacity={0.55} />
+                  <stop offset="100%" stopColor="#905BF4" stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <XAxis dataKey="label" tick={{ fill: "#8A82A6", fontSize: 10 }} axisLine={false} tickLine={false} interval="preserveStartEnd" />
+              <YAxis yAxisId="v" tick={{ fill: "#8A82A6", fontSize: 10 }} axisLine={false} tickLine={false} tickFormatter={formatCompact} width={44} />
+              <YAxis yAxisId="e" orientation="right" hide domain={["auto", "auto"]} />
+              <Tooltip
+                contentStyle={tooltipStyle}
+                formatter={(v: number, name) => (name === "views" ? [formatFull(v), "Views"] : [formatPercent(v, 2), "Engagement"])}
+              />
+              <Area yAxisId="v" type="monotone" dataKey="views" stroke="#905BF4" strokeWidth={2} fill="url(#viewsFill)" isAnimationActive={false} />
+              <Line yAxisId="e" type="monotone" dataKey="engagement" stroke="#D946EF" strokeWidth={1.5} dot={false} isAnimationActive={false} />
+            </ComposedChart>
+          </ResponsiveContainer>
+        ) : (
+          <div className="flex h-full items-center justify-center text-center text-xs text-ink-muted">
+            Trend appears after the second daily sync.
+          </div>
+        )}
+      </div>
+    </section>
+  );
 }
 
-function StatTile({ label, value, hint }: StatTileProps) {
+function TopPostsPanel({ posts }: { posts: TopPost[] }) {
   return (
-    <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-      <div className="text-sm text-slate-600">{label}</div>
-      <div className="mt-1 text-2xl font-bold tabular-nums text-slate-900">{value}</div>
-      <div className="text-xs text-slate-500">{hint}</div>
-    </div>
+    <section className="panel p-3" aria-labelledby="posts-h">
+      <h2 id="posts-h" className="panel-title">
+        Top posts
+      </h2>
+      {posts.length === 0 ? (
+        <div className="flex flex-1 items-center justify-center text-xs text-ink-muted">No post-level data yet.</div>
+      ) : (
+        <ol className="mt-1.5 flex min-h-0 flex-1 flex-col justify-between gap-1">
+          {posts.slice(0, 5).map((p, i) => {
+            const body = (
+              <>
+                <span className="w-3 font-mono text-[10px] text-ink-faint">{i + 1}</span>
+                <PlatformBadge name={p.platform} size="h-4 w-4" />
+                <span className="min-w-0 flex-1 truncate text-xs text-ink">{p.title}</span>
+                <span className="text-xs font-semibold tabular-nums text-ink">{formatCompact(p.views)}</span>
+                <span className="w-12 text-right text-[11px] tabular-nums text-ink-faint">♥ {formatCompact(p.likes)}</span>
+              </>
+            );
+            return (
+              <li key={p.id}>
+                {p.url ? (
+                  <a href={p.url} target="_blank" rel="noreferrer noopener" className="flex items-center gap-2 rounded px-1 py-0.5 hover:bg-white/5">
+                    {body}
+                  </a>
+                ) : (
+                  <div className="flex items-center gap-2 px-1 py-0.5">{body}</div>
+                )}
+              </li>
+            );
+          })}
+        </ol>
+      )}
+    </section>
+  );
+}
+
+function PlatformTable({
+  payload,
+  hidden,
+}: {
+  payload: DailyPayload;
+  hidden: ReadonlySet<string>;
+}) {
+  const rows = useMemo(() => [...payload.metrics].sort((a, b) => b.views - a.views), [payload.metrics]);
+  const maxViews = Math.max(1, ...rows.map((r) => r.views));
+
+  return (
+    <section className="panel p-3" aria-labelledby="platforms-h">
+      <h2 id="platforms-h" className="panel-title">
+        Platform overview
+      </h2>
+      <div className="mt-1.5 grid grid-cols-[minmax(0,1.5fr)_1fr_0.8fr_0.8fr_0.8fr] gap-x-2 border-b border-white/10 pb-1 text-[10px] uppercase tracking-wider text-ink-faint">
+        <span>Platform</span>
+        <span className="text-right">Views</span>
+        <span className="text-right">Retain</span>
+        <span className="text-right">Likes/v</span>
+        <span className="text-right">Share</span>
+      </div>
+      <ul className="flex min-h-0 flex-1 flex-col">
+        {rows.map((m) => {
+          const prev = payload.previousViews[m.id] ?? 0;
+          const delta = prev > 0 ? (m.views - prev) / prev : 0;
+          return (
+            <li
+              key={m.id}
+              className={cn(
+                "grid min-h-0 flex-1 grid-cols-[minmax(0,1.5fr)_1fr_0.8fr_0.8fr_0.8fr] items-center gap-x-2 border-b border-white/5 text-xs last:border-0",
+                hidden.has(m.id) && "opacity-45",
+              )}
+            >
+              <span className="flex min-w-0 items-center gap-2">
+                <PlatformBadge name={m.name} />
+                <span className="truncate font-medium">{PLATFORM_META[m.name].label}</span>
+              </span>
+              <span className="flex flex-col items-end leading-tight">
+                <span className="font-semibold tabular-nums">{formatCompact(m.views)}</span>
+                <Delta value={delta} className="text-[10px]" />
+              </span>
+              <span className="text-right tabular-nums text-ink-muted">{pct(m.retentionRate)}</span>
+              <span className="text-right tabular-nums text-ink-muted">{pct(m.likesPerView)}</span>
+              <span className="text-right tabular-nums text-ink-muted">{pct(m.shareRate)}</span>
+              <span className="col-span-5 -mt-0.5 hidden h-0.5 overflow-hidden rounded-full bg-white/5 2xl:block" aria-hidden>
+                <span
+                  className="block h-full rounded-full"
+                  style={{ width: `${(m.views / maxViews) * 100}%`, backgroundColor: colorOf(m.name) }}
+                />
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+      {(payload.unconnected?.length ?? 0) > 0 && (
+        <div className="mt-1.5 flex items-start gap-1.5 text-[11px] text-ink-faint">
+          <Unplug className="mt-0.5 h-3 w-3 shrink-0" aria-hidden />
+          <span>Not connected: {payload.unconnected!.map((n) => PLATFORM_META[n].label).join(", ")}</span>
+        </div>
+      )}
+    </section>
   );
 }
 
 /* --------------------------------- page --------------------------------- */
 
 export default function SocialDashboard() {
-  const [dayOffset, setDayOffset] = useState<number>(readOffset);
-  const now = useSimulatedNow(dayOffset);
-  const todayKey = utcDateKey(now);
+  const { payload, loading, now, nextRefresh, stale, reload } = useDailyPayload();
+  const [hidden, setHidden] = useState<ReadonlySet<string>>(() => new Set());
 
-  const [payload, setPayload] = useState<DailyPayload>(
-    () => readCache() ?? buildDailyPayload(new Date(Date.now() + readOffset() * DAY_MS)),
-  );
-  const [syncing, setSyncing] = useState(false);
-  const [status, setStatus] = useState<string>("");
-  const [hiddenIds, setHiddenIds] = useState<ReadonlySet<string>>(() => new Set());
-
-  const isCurrent = payload.date === todayKey;
-  const nextUpdateMs = startOfUtcDay(new Date(now.getTime() + DAY_MS)).getTime() - now.getTime();
-
-  useEffect(() => {
-    writeCache(payload);
-  }, [payload]);
-
-  const sync = useCallback(async () => {
-    if (syncing) return;
-    if (isCurrent) {
-      setStatus(`Already up to date. Next daily update in ${formatCountdown(nextUpdateMs)}.`);
-      return;
-    }
-    setSyncing(true);
-    setStatus("Fetching today's payload…");
-    const fresh = await fetchDailyPayload(now);
-    setPayload(fresh);
-    setSyncing(false);
-    setStatus(`Synced ${fresh.date} data for all 11 platforms.`);
-  }, [syncing, isCurrent, nextUpdateMs, now]);
-
-  const simulateNextDay = useCallback(() => {
-    const next = dayOffset + 1;
-    setDayOffset(next);
-    writeOffset(next);
-    setStatus("Clock advanced 24h. A new daily payload is available to sync.");
-  }, [dayOffset]);
-
-  const toggle = useCallback((id: string) => {
-    setHiddenIds((prev) => {
+  const toggle = (id: string) =>
+    setHidden((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
     });
-  }, []);
 
-  const sorted = useMemo(
-    () => [...payload.metrics].sort((a, b) => b.views - a.views),
-    [payload.metrics],
-  );
-
-  const chartData: ChartDatum[] = useMemo(
-    () =>
-      sorted.map((m) => ({
-        id: m.id,
-        name: m.name,
-        label: PLATFORM_META[m.name].label,
-        views: m.views,
-        color: PLATFORM_META[m.name].color,
-      })),
-    [sorted],
-  );
-  const visibleData = useMemo(() => chartData.filter((d) => !hiddenIds.has(d.id)), [chartData, hiddenIds]);
-
-  const totalAll = useMemo(() => chartData.reduce((s, d) => s + d.views, 0), [chartData]);
-  const totalVisible = useMemo(() => visibleData.reduce((s, d) => s + d.views, 0), [visibleData]);
-  const previousTotal = useMemo(
-    () => Object.values(payload.previousViews).reduce((s, v) => s + v, 0),
-    [payload.previousViews],
-  );
-
-  const weighted = useMemo(() => {
-    const w = (pick: (m: PlatformDailyMetric) => number): number =>
-      payload.metrics.reduce((s, m) => s + pick(m) * m.views, 0) / totalAll;
-    return {
-      retention: w((m) => m.retentionRate),
-      likes: w((m) => m.likesPerView),
-      share: w((m) => m.shareRate),
+  const stats = useMemo(() => {
+    if (!payload) return null;
+    const totalViews = payload.metrics.reduce((s, m) => s + m.views, 0);
+    const prevTotal = Object.values(payload.previousViews).reduce((s, v) => s + v, 0);
+    const weighted = (pick: (m: PlatformDailyMetric) => number) => {
+      // Skip platforms that don't report the metric (value 0) so they don't drag the average down.
+      const rows = payload.metrics.filter((m) => pick(m) > 0);
+      const w = rows.reduce((s, m) => s + m.views, 0);
+      return w > 0 ? rows.reduce((s, m) => s + pick(m) * m.views, 0) / w : 0;
     };
-  }, [payload.metrics, totalAll]);
+    const chart: ChartDatum[] = [...payload.metrics]
+      .sort((a, b) => b.views - a.views)
+      .map((m) => ({ id: m.id, label: PLATFORM_META[m.name].label, views: m.views, color: colorOf(m.name) }));
+    return {
+      totalViews,
+      delta: prevTotal > 0 ? (totalViews - prevTotal) / prevTotal : undefined,
+      retention: weighted((m) => m.retentionRate),
+      likes: weighted((m) => m.likesPerView),
+      share: weighted((m) => m.shareRate),
+      chart,
+    };
+  }, [payload]);
 
-  const maxima = useMemo(
-    () => ({
-      retention: Math.max(...payload.metrics.map((m) => m.retentionRate)),
-      likes: Math.max(...payload.metrics.map((m) => m.likesPerView)),
-      share: Math.max(...payload.metrics.map((m) => m.shareRate)),
-    }),
-    [payload.metrics],
-  );
-
-  const totalDelta = previousTotal > 0 ? (totalAll - previousTotal) / previousTotal : 0;
-
-  const updatedLabel = isCurrent
-    ? "Updated today at 00:00 UTC"
-    : `Updated ${payload.date} at 00:00 UTC (out of date)`;
+  const isDemo = payload?.source !== "live";
 
   return (
-    <div className="min-h-screen">
-      <div className="mx-auto max-w-screen-2xl px-4 py-6 sm:px-6 lg:px-8">
-        {/* Header + sync controls */}
-        <header className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
-          <div>
-            <h1 className="text-2xl font-bold tracking-tight text-slate-900 sm:text-3xl">
-              Social Analytics
-            </h1>
-            <p className="mt-1 text-slate-600">
-              Daily performance across 11 platforms. Platform APIs report on a 24-hour cycle.
-            </p>
+    <div className="flex flex-col gap-3 p-3 lg:h-screen lg:overflow-hidden">
+      {/* Header */}
+      <header className="flex shrink-0 flex-wrap items-center justify-between gap-x-4 gap-y-2">
+        <div className="flex items-center gap-3">
+          <span className="grid h-8 w-8 place-items-center rounded-lg bg-gradient-to-br from-violet-bright to-accent-blue font-mono text-sm font-bold text-white shadow-glow" aria-hidden>
+            S
+          </span>
+          <div className="leading-tight">
+            <h1 className="text-base font-semibold tracking-tight">Social Command Center</h1>
+            <p className="text-[11px] text-ink-faint">Daily performance across {payload?.metrics.length ?? "—"} connected platforms</p>
           </div>
+          <span
+            className={cn(
+              "chip ml-1",
+              isDemo ? "border-warn/40 text-warn" : "border-up/40 text-up",
+            )}
+          >
+            <span className={cn("h-1.5 w-1.5 rounded-full", isDemo ? "bg-warn" : "bg-up")} aria-hidden />
+            {isDemo ? "Demo data" : "Live"}
+          </span>
+        </div>
 
-          <div className="flex flex-col gap-3 rounded-xl border border-slate-200 bg-white p-3 shadow-sm sm:flex-row sm:items-center">
-            <div className="space-y-1 text-sm">
-              <div className="flex items-center gap-2 font-medium text-slate-900">
-                {isCurrent ? (
-                  <CheckCircle2 className="h-4 w-4 text-emerald-700" aria-hidden="true" />
-                ) : (
-                  <CalendarClock className="h-4 w-4 text-amber-700" aria-hidden="true" />
-                )}
-                <span>{updatedLabel}</span>
-              </div>
-              <div className="flex items-center gap-2 text-slate-600">
-                <Timer className="h-4 w-4" aria-hidden="true" />
-                <span>
-                  Next daily update in: <strong className="tabular-nums text-slate-900">{formatCountdown(nextUpdateMs)}</strong>
-                </span>
-              </div>
+        <div className="flex items-center gap-3 text-[11px] text-ink-muted" role="status" aria-live="polite">
+          <span className="chip">
+            {stale ? <CalendarClock className="h-3 w-3 text-warn" aria-hidden /> : <CheckCircle2 className="h-3 w-3 text-up" aria-hidden />}
+            {payload ? `Updated ${formatClockTime(payload.syncedAt, DASHBOARD_TZ)}` : "Loading…"}
+          </span>
+          <span className="chip">
+            <Timer className="h-3 w-3" aria-hidden />
+            Next refresh 12:00 AM CT · in{" "}
+            <strong className="tabular-nums text-ink">{formatCountdown(nextRefresh.getTime() - now.getTime())}</strong>
+          </span>
+          <button type="button" onClick={reload} disabled={loading} className="btn-primary">
+            <RefreshCw className={cn("h-3.5 w-3.5", loading && "animate-spin")} aria-hidden />
+            {loading ? "Loading…" : "Reload"}
+          </button>
+        </div>
+      </header>
+
+      {!payload || !stats ? (
+        <div className="panel flex flex-1 items-center justify-center text-sm text-ink-muted">Loading analytics…</div>
+      ) : (
+        <>
+          {/* KPI row */}
+          <section aria-label="Totals" className="grid shrink-0 grid-cols-2 gap-3 lg:grid-cols-4">
+            <Kpi label="Total views" value={formatCompact(stats.totalViews)} delta={stats.delta} hint="vs yesterday" />
+            <Kpi label="Avg. retention" value={pct(stats.retention)} hint="Weighted by views · where reported" />
+            <Kpi label="Avg. likes / view" value={pct(stats.likes)} hint="Weighted by views" />
+            <Kpi label="Avg. share rate" value={pct(stats.share)} hint="Weighted by views" />
+          </section>
+
+          {/* Main grid fills the remaining height; every panel manages its own overflow. */}
+          <main className="grid min-h-0 flex-1 grid-cols-1 gap-3 lg:grid-cols-12">
+            <div className="grid min-h-[22rem] lg:col-span-3 lg:min-h-0">
+              <BreakdownPanel data={stats.chart} hidden={hidden} onToggle={toggle} onReset={() => setHidden(new Set())} />
             </div>
-            <div className="flex gap-2">
-              <button
-                type="button"
-                onClick={sync}
-                disabled={syncing}
-                className={cn(
-                  "inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-semibold focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-600 focus-visible:ring-offset-2 disabled:cursor-wait disabled:opacity-70",
-                  isCurrent
-                    ? "border border-slate-300 bg-white text-slate-800 hover:bg-slate-100"
-                    : "bg-indigo-700 text-white hover:bg-indigo-800",
-                )}
-              >
-                <RefreshCw className={cn("h-4 w-4", syncing && "animate-spin")} aria-hidden="true" />
-                {syncing ? "Syncing…" : isCurrent ? "Check for update" : "Sync today's data"}
-              </button>
-              <button
-                type="button"
-                onClick={simulateNextDay}
-                className="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-800 hover:bg-slate-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-600 focus-visible:ring-offset-2"
-                title="Demo only: advance the simulated clock by 24 hours"
-              >
-                <FastForward className="h-4 w-4" aria-hidden="true" />
-                Simulate next day
-              </button>
+            <div className="grid min-h-[28rem] grid-rows-[1.15fr_1fr] gap-3 lg:col-span-5 lg:min-h-0">
+              <TrendPanel payload={payload} />
+              <TopPostsPanel posts={payload.topPosts ?? []} />
             </div>
-          </div>
-        </header>
-
-        <p role="status" aria-live="polite" className="mt-3 min-h-5 text-sm text-slate-600">
-          {status}
-        </p>
-
-        {/* KPI row */}
-        <section aria-label="Totals" className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          <StatTile
-            label="Total views"
-            value={formatCompact(totalAll)}
-            hint={`${totalDelta >= 0 ? "+" : "−"}${formatPercent(Math.abs(totalDelta))} vs yesterday`}
-          />
-          <StatTile label="Avg. retention rate" value={formatPercent(weighted.retention)} hint="Weighted by views" />
-          <StatTile label="Avg. likes per view" value={formatPercent(weighted.likes)} hint="Weighted by views" />
-          <StatTile label="Avg. share rate" value={formatPercent(weighted.share)} hint="Weighted by views" />
-        </section>
-
-        {/* Donut + legend */}
-        <section
-          aria-labelledby="views-breakdown"
-          className="mt-6 rounded-xl border border-slate-200 bg-white p-4 shadow-sm sm:p-6"
-        >
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <h2 id="views-breakdown" className="text-lg font-semibold text-slate-900">
-              Views breakdown
-            </h2>
-            <button
-              type="button"
-              onClick={() => setHiddenIds(new Set())}
-              disabled={hiddenIds.size === 0}
-              className="rounded-md border border-slate-300 px-2.5 py-1 text-sm font-medium text-slate-700 hover:bg-slate-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-600 disabled:opacity-50"
-            >
-              Show all platforms
-            </button>
-          </div>
-
-          <div className="mt-4 grid grid-cols-1 items-center gap-6 lg:grid-cols-2">
-            <div className="relative mx-auto h-72 w-full max-w-md sm:h-96">
-              {visibleData.length > 0 ? (
-                <ResponsiveContainer width="100%" height="100%">
-                  <PieChart>
-                    <Pie
-                      data={visibleData}
-                      dataKey="views"
-                      nameKey="label"
-                      innerRadius="62%"
-                      outerRadius="92%"
-                      paddingAngle={2}
-                      stroke="#FFFFFF"
-                      strokeWidth={2}
-                    >
-                      {visibleData.map((d) => (
-                        <Cell key={d.id} fill={d.color} />
-                      ))}
-                    </Pie>
-                    <Tooltip content={<ChartTooltip total={totalVisible} />} />
-                  </PieChart>
-                </ResponsiveContainer>
-              ) : (
-                <div className="flex h-full items-center justify-center text-center text-slate-600">
-                  All platforms are hidden.
-                  <br />
-                  Toggle one in the legend.
-                </div>
-              )}
-              {visibleData.length > 0 && (
-                <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
-                  <span className="text-sm text-slate-600">
-                    {visibleData.length} of {chartData.length} platforms
-                  </span>
-                  <span className="text-3xl font-bold tabular-nums text-slate-900">
-                    {formatCompact(totalVisible)}
-                  </span>
-                  <span className="text-sm text-slate-600">views</span>
-                </div>
-              )}
+            <div className="grid min-h-[26rem] lg:col-span-4 lg:min-h-0">
+              <PlatformTable payload={payload} hidden={hidden} />
             </div>
-
-            <ul className="grid grid-cols-1 gap-2 sm:grid-cols-2" aria-label="Chart legend, toggle platforms">
-              {chartData.map((d) => {
-                const hidden = hiddenIds.has(d.id);
-                return (
-                  <li key={d.id}>
-                    <button
-                      type="button"
-                      onClick={() => toggle(d.id)}
-                      aria-pressed={!hidden}
-                      className={cn(
-                        "flex w-full items-center gap-3 rounded-lg border border-slate-200 px-3 py-2 text-left text-sm hover:bg-slate-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-600",
-                        hidden && "bg-slate-50 text-slate-500",
-                      )}
-                    >
-                      <span
-                        className={cn("h-4 w-4 shrink-0 rounded-sm border border-slate-400", hidden && "opacity-30")}
-                        style={{ backgroundColor: d.color }}
-                        aria-hidden="true"
-                      />
-                      <span className={cn("flex-1 font-medium", hidden ? "text-slate-500 line-through" : "text-slate-900")}>
-                        {d.label}
-                      </span>
-                      <span className="tabular-nums text-slate-600">
-                        {formatCompact(d.views)} · {formatPercent(d.views / totalAll)}
-                      </span>
-                    </button>
-                  </li>
-                );
-              })}
-            </ul>
-          </div>
-        </section>
-
-        {/* Platform cards */}
-        <section aria-labelledby="platform-metrics" className="mt-6">
-          <h2 id="platform-metrics" className="text-lg font-semibold text-slate-900">
-            Engagement &amp; performance by platform
-          </h2>
-          <div className="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-            {sorted.map((m) => (
-              <PlatformCard
-                key={m.id}
-                metric={m}
-                previousViews={payload.previousViews[m.id] ?? 0}
-                maxima={maxima}
-                hidden={hiddenIds.has(m.id)}
-                onToggle={() => toggle(m.id)}
-              />
-            ))}
-          </div>
-        </section>
-
-        <footer className="mt-8 text-center text-xs text-slate-500">
-          Mock data, cached locally. Real platform APIs refresh once every 24 hours (00:00 UTC).
-        </footer>
-      </div>
+          </main>
+        </>
+      )}
     </div>
   );
 }
